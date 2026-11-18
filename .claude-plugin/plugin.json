@@ -1,0 +1,12 @@
+{
+  "name": "live-qa",
+  "version": "0.1.0",
+  "description": "Step-by-step live QA in a real browser: numbered screenshot per step, pass/fail table, console/network/a11y evidence.",
+  "author": {
+    "name": "Ibrahim M. Badr",
+    "url": "https://github.com/ibrahimbdr"
+  },
+  "homepage": "https://github.com/ibrahimbdr/live-qa",
+  "license": "MIT",
+  "skills": "./skills"
+}

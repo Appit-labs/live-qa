@@ -1,0 +1,34 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 2
+scanner_version: 2.12.0
+rules: []
+fingerprints:
+- hash: sha256:80b0d5fcf390b7ff8cb46a6fef59dba1112e970d89c3a164cfda9f08c47a2690
+  rule_id: RP1
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:8c625a40fae2bc8ca2bc9d65210473b79e51b6453ada0c873c7c54c21a5991a0
+  rule_id: RP1
+  file: scripts/drive.mjs
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:f035e516a01fb3274d2776b3bb2e77203a8afd9f705d8ae747ee8c31a3258e77
+  rule_id: RP1
+  file: scripts/drive.mjs
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:f79560e10636e813ef5e5e1c46f3f3699ecc049e65289b076b70101fa7bf5266
+  rule_id: RP1
+  file: scripts/drive.mjs
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:63fdb495d80473847cc9d318dd69632157f1c0768575ccd821d164057c4a606e
+  rule_id: AE1
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:28f03cd164b2032d91318cd117ef775d2a0e6274abe3825f6959e0df2d4231ec
+  rule_id: AE1
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:8b6c70d42937515bc89a3452277c0e1c1a6ef8bd88f72d5357299323a0c37fdc
+  rule_id: AE1
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
