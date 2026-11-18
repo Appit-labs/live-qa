@@ -127,6 +127,11 @@ an authenticated endpoint.
 The demo above is not a mockup: `demos/live-qa.json` holds the captured run and
 `tools/make_demo.py` renders it, so it can be regenerated and audited.
 
+## Write-up
+
+The Turnstile finding behind this skill, in article form:
+[your-cloudflare-turnstile-may-never-be-issuing-a-token-here-…](https://dev.to/ibrahimbdr/your-cloudflare-turnstile-may-never-be-issuing-a-token-here-is-the-one-liner-that-tells-you-4h75)
+
 ## Security
 
 SkillSpector: **0/100, SAFE, 0 open findings** against the committed baseline. Every accepted
