@@ -110,35 +110,81 @@ Load only what the run needs — these live outside this file to keep it small:
   native tools of pi, Claude Code, Codex and Cursor.
 - `references/promoting-to-a-spec.md` — turning a green run into a Playwright test.
 
-## 6. Auth — and proving it worked
+## 6. Auth — get it once, prove it, never store the password
 
-Being on a page is not being signed in. Two failures cost runs: a redirect you did
-not notice, and a UI that renders its shell while every API call returns 401.
-Prove state first:
+A login form on the current page proves nothing: an app can render its shell while
+every API answers 401. And a password is the wrong thing to keep — the reusable
+artifact is the **session** it produces (the same conclusion Playwright's own auth
+guide reaches: log in once, save `storageState`, reuse it).
+
+`drive.mjs` implements the four ways to get that session, best first.
+
+### a) A state file — the default
 
 ```bash
-$D eval "JSON.stringify({url: location.href, loginForm: !!document.querySelector('input[type=password], input[name=username]')})"
-$D network        # a 401 from any authenticated endpoint means you are a guest
+# once, in a shell that has a TEST account (never a personal one):
+LIVE_QA_USER=… LIVE_QA_PASS=… node drive.mjs start https://stage.example.com
+node drive.mjs auth login --save .tmp/live-qa/auth/stage.json \
+     --user-selector "#username" --pass-selector "#password"
+# later, and in CI, with no credentials in the environment at all:
+node drive.mjs start https://stage.example.com --storage .tmp/live-qa/auth/stage.json
+node drive.mjs auth probe --check https://stage.example.com/dashboard \
+     --api https://stage.example.com/api/me
 ```
 
-Ways to get a real session, best first:
+`auth login` fills the form, submits, then **verifies** before it claims success. The
+state file holds cookies + localStorage (+ IndexedDB, needed for Firebase/MSAL), is
+written `0600` in a `0700` directory, and never contains the password — verified.
 
-1. **A profile directory** — `start <url> --profile /path/to/profile` reuses that
-   profile's login state. It must not be locked by a running browser; copy it if the
-   user's Chrome is open: `cp -r ~/.config/google-chrome/Default /tmp/qa-prof`.
-   **Verified limit:** cookies only decrypt for the same OS user, and nothing is
-   restored if the session had already expired there. Prove the login with the check
-   above; never assume it.
-2. **Test account** — if the user provides one (env var, secrets manager), fill and
-   submit the login form. That is a real mutation: ask first, and never put the
-   password in a screenshot or the report.
-3. **SSO (Google / Microsoft)** — cannot be automated: it is the user's account and
-   their 2FA. Run headed (`--headed`) and ask them to finish it in that window, then
-   continue.
+### b) A minted token — the CI path
 
-If none works, say "I could not get an authenticated session" and test only the
-public surface. An untested authenticated flow is a finding, not something to paper
-over.
+When the backend can issue a session for a test user (the usual "test token
+endpoint" pattern in lower environments), inject it and skip the UI entirely:
+
+```bash
+SESSION_TOKEN=$(curl -s -X POST "$STAGE/api/test-session" -d '{"role":"qa"}' | jq -r .token)
+SESSION_TOKEN="$SESSION_TOKEN" node drive.mjs auth inject \
+  --cookie "session=$SESSION_TOKEN" --url https://stage.example.com \
+  --check https://stage.example.com/dashboard
+# or, for a SPA that keeps a JWT in localStorage:
+SESSION_TOKEN=… node drive.mjs auth inject --local-storage "auth_token=SESSION_TOKEN"
+```
+
+The value is read in your shell and sent once over the local unix socket; it never
+appears in argv, logs or on disk.
+
+### c) SSO — the human signs in once
+
+Google/Microsoft/Okta cannot be automated: MFA is the point. Run headed, ask the
+user to finish the sign-in in that window, then capture the state:
+
+```bash
+node drive.mjs start https://stage.example.com --headed
+# … user signs in …
+node drive.mjs auth state .tmp/live-qa/auth/stage-sso.json
+```
+
+### d) A copied Chrome profile — last resort
+
+`start <url> --profile /path/to/profile` reuses a real profile. It only works if
+Chrome is not holding it, cookies decrypt for the same OS user, and the session has
+not expired — **verified to fail silently otherwise**, so always follow it with
+`auth probe`.
+
+### Rules that keep this safe
+
+- **Test accounts only**, one per role (admin, member) — never a personal login, never
+  `admin@company.com` shared across parallel runs.
+- **No password on disk, in git, in argv or in a screenshot.** `auth login` reads it
+  from `$LIVE_QA_USER` / `$LIVE_QA_PASS` only.
+- `.tmp/live-qa/auth/` belongs in `.gitignore`; a state file is a live session, so it
+  is `0600`, expires on its own, and `auth state` should be re-captured when stale
+  rather than carried between environments.
+- **Prove it**: `auth probe` exits 0 only when authenticated (no password field, not
+  redirected to `/login`, and 200 from `--api` when given). Exit 2 means guest —
+  report that instead of testing a logged-out app and calling the results QA.
+- A `--check` URL is mandatory in practice: probe a page or endpoint that only
+  responds when signed in.
 
 ## 7. Stop and ask before these
 

@@ -47,6 +47,36 @@ cp -r live-qa/skills/live-qa ~/.claude/skills/      # or ~/.codex/skills/, .curs
 - **One flow, forced** — `/skill:live-qa test the checkout flow on staging`
 - **Regression suite** — `references/promoting-to-a-spec.md` — only steps that went green
 
+## Logging in, without storing a password
+
+Four ways to get an authenticated session, best first — the reusable artifact is the
+**session**, never the password (the same conclusion Playwright's own auth guide reaches):
+
+```bash
+# 1. a state file: log in once with a TEST account, reuse cookies + localStorage
+LIVE_QA_USER=… LIVE_QA_PASS=… node <skill>/scripts/drive.mjs start https://stage.example.com
+node <skill>/scripts/drive.mjs auth login --save .tmp/live-qa/auth/stage.json
+node <skill>/scripts/drive.mjs start https://stage.example.com --storage .tmp/live-qa/auth/stage.json
+
+# 2. a minted token: no UI login at all (the CI path)
+SESSION_TOKEN=$(curl -s -X POST "$STAGE/api/test-session" | jq -r .token) \
+  node <skill>/scripts/drive.mjs auth inject --cookie "session=$SESSION_TOKEN"
+
+# 3. SSO (Google/Microsoft/Okta): sign in once in a headed window, then capture
+node <skill>/scripts/drive.mjs start https://stage.example.com --headed
+node <skill>/scripts/drive.mjs auth state .tmp/live-qa/auth/stage-sso.json
+
+# 4. always prove it — exits 0 only when actually authenticated
+node <skill>/scripts/drive.mjs auth probe \
+  --check https://stage.example.com/dashboard --api https://stage.example.com/api/me
+```
+
+Rules the tool enforces: credentials only from `$LIVE_QA_USER` / `$LIVE_QA_PASS` (never
+argv, never disk, never screenshotted); state files are `0600` in a `0700` `.tmp/` dir
+and contain no password; `auth probe` refuses to let you confuse "page rendered" with
+"signed in" — it checks for a login form, a redirect to `/login`, and the status code of
+an authenticated endpoint.
+
 ## What it does not do
 
 - It does not write a test suite for you; promotion is a deliberate, separate step.

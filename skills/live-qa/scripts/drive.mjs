@@ -22,10 +22,10 @@
  * `start` launches a detached daemon that owns the browser, so state survives between
  * commands. The daemon speaks JSON over a UNIX socket in /tmp/qa-driver/daemon.sock.
  */
-import { mkdirSync, readFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync, rmSync, readdirSync, chmodSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createServer, connect } from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,9 @@ window.__qa = window.__qa || { console: [], errors: [], failed: [] };
 })();
 `;
 const isDaemon = process.argv.includes("--daemon");
+const fail = (msg, code = 1) => { console.error(msg); process.exit(code); };
+// Inside the daemon a bad request must not kill the browser: throw, let the reply carry it.
+const bad = (msg) => { throw new Error(msg); };
 
 function parseArgs(argv) {
   const positional = [];
@@ -114,6 +117,10 @@ async function daemon() {
       if (flags.viewport) {
         const [w, h] = String(flags.viewport).split("x").map(Number);
         opts.viewport = { width: w, height: h };
+      }
+      if (flags.storage) {
+        const state = JSON.parse(readFileSync(flags.storage, "utf8"));
+        opts.storageState = state;
       }
       ctx = await launch(opts);
       await ctx.addInitScript(INIT);
@@ -173,8 +180,110 @@ async function daemon() {
       if (flags.clear) await page.evaluate(() => { window.__qa.failed = []; });
       return { failed: data };
     },
+
+    /* ---------------------------------------------------------- auth --------- */
+    async state({ positional }) {
+      // storageState = cookies + localStorage (+ IndexedDB). It is a live session:
+      // write it 0600, under a directory the project ignores, never into git.
+      const file = positional[0] || bad("state needs a file path");
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+      await ctx.storageState({ path: file, indexedDB: true });
+      try { chmodSync(file, 0o600); } catch {}
+      const state = JSON.parse(readFileSync(file, "utf8"));
+      return { file, cookies: (state.cookies || []).length,
+               origins: (state.origins || []).length, bytes: readFileSync(file).length };
+    },
+
+    async "auth-login"(req) {
+      const { flags } = req;
+      const userEnv = flags["user-env"] || "LIVE_QA_USER";
+      const passEnv = flags["pass-env"] || "LIVE_QA_PASS";
+      const user = flags["user-value"] || process.env[userEnv];
+      const pass = flags["pass-value"] || process.env[passEnv];
+      if (!user || !pass) {
+        return { error: `no credentials in the environment: expected $${userEnv} and $${passEnv}. ` +
+          "Export them in this shell (they are never written to disk), or use `auth manual` for SSO." };
+      }
+      const userSel = flags["user-selector"] ||
+        "input[name=username], input[name=user-name], input#username, input[id*=user i], input[type=email]";
+      const passSel = flags["pass-selector"] || "input[type=password]";
+      const submitSel = flags["submit-selector"] ||
+        'input[type=submit], button[type=submit], button:has-text("Login"), button:has-text("Sign in")';
+      await page.locator(userSel).first().fill(user, { timeout: 15000 });
+      await page.locator(passSel).first().fill(pass, { timeout: 15000 });
+      await Promise.all([
+        page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {}),
+        page.locator(submitSel).first().click({ timeout: 15000 }),
+      ]);
+      await page.waitForTimeout(800);
+      const after = await probeState(req);
+      if (!after.authenticated) return { ...after, error: "still not authenticated after submit" };
+      if (flags.save) {
+        const saved = await handlers.state({ positional: [flags.save] });
+        return { ...after, stateFile: saved.file, cookies: saved.cookies };
+      }
+      return after;
+    },
+
+    async "auth-probe"(req) { return probeState(req); },
+
+    async "auth-inject"(req) {
+      // Backend-minted session: pass a token/cookie in from the environment.
+      const { flags } = req;
+      const url = new URL(flags.url || page.url());
+      const injected = [];
+      if (flags.cookie) {
+        const [name, envVar] = flags.cookie.split("=");
+        const value = flags["cookie-value"] || process.env[envVar || name];
+        if (!value) bad(`env $${envVar || name} is empty`);
+        await ctx.addCookies([{ name, value, domain: flags.domain || url.hostname,
+                                path: "/", httpOnly: flags.httpOnly !== false,
+                                secure: url.protocol === "https:", sameSite: "Lax" }]);
+        injected.push(`cookie ${name}`);
+      }
+      if (flags["local-storage"]) {
+        const [key, envVar] = flags["local-storage"].split("=");
+        const value = flags["local-storage-value"] || process.env[envVar || key];
+        if (!value) bad(`env $${envVar || key} is empty`);
+        await ctx.addInitScript(([k, v]) => { try { localStorage.setItem(k, v); } catch {} }, [key, value]);
+        injected.push(`localStorage ${key}`);
+      }
+      if (!injected.length) bad("nothing to inject: pass --cookie NAME=ENV or --local-storage KEY=ENV");
+      if (flags.reload !== false) await page.reload({ waitUntil: "domcontentloaded" });
+      const after = await probeState(req);
+      return { injected, ...after };
+    },
+
     async close() { await ctx?.close(); return { closed: true }; },
   };
+
+  async function probeState(req) {
+    const { flags } = req;
+    // A login form on the *current* page proves little — probe a page that only
+    // renders when authenticated, or an API that only answers 200 when it is.
+    if (flags.check) {
+      await page.goto(String(flags.check), { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    const loginForm = await page.evaluate(() =>
+      !!document.querySelector('input[type=password]')).catch(() => null);
+    let apiStatus = null;
+    if (flags.api) {
+      try {
+        apiStatus = await page.evaluate(async (u) => {
+          const r = await fetch(u, { credentials: "include" });
+          return r.status;
+        }, flags.api);
+      } catch { apiStatus = "error"; }
+    }
+    const cookies = (await ctx.cookies()).map(c => `${c.name}${c.expires > 0 ? "" : " (session)"}`);
+    const redirectedToLogin = /\/(login|signin|sign-in|auth)(\?|$)/i.test(page.url());
+    const authenticated = flags.api
+      ? apiStatus === 200
+      : (loginForm === false && !redirectedToLogin);
+    return { url: page.url(), loginForm, redirectedToLogin, apiStatus, cookies,
+             authenticated: Boolean(authenticated), htmlTitle: await page.title() };
+  }
 
   function locator({ positional, flags }) {
     if (flags.selector) return page.locator(String(flags.selector)).first();
@@ -259,6 +368,40 @@ if (isDaemon) {
   try {
     const res = await send("start", positional, flags);
     console.log(JSON.stringify(res));
+  } catch (e) { console.error(String(e.message)); process.exit(1); }
+} else if (cmd === "auth") {
+  const sub = positional[0];
+  const map = { login: "auth-login", probe: "auth-probe", inject: "auth-inject", state: "state" };
+  const verb = map[sub] || fail(`auth needs one of: probe | login | state | inject`);
+  if (verb === "auth-login") {
+    // Credentials belong to the shell that runs the command, not to a daemon started
+    // minutes earlier: resolve them here and hand them over once, in memory only.
+    const pair = [[["user-env", "LIVE_QA_USER"], "user-value"],
+                  [["pass-env", "LIVE_QA_PASS"], "pass-value"]];
+    for (const [[flag, def], target] of pair) {
+      const envName = flags[flag] || def;
+      const value = process.env[envName];
+      if (value) flags[target] = value;
+    }
+  }
+  if (verb === "auth-inject") {
+    // A minted token usually lives in the caller's shell, not the daemon's. Resolve it
+    // here and send it once over the unix socket: it never touches disk or argv.
+    for (const [flag, target] of [["cookie", "cookie-value"], ["local-storage", "local-storage-value"]]) {
+      const spec = flags[flag];
+      if (typeof spec === "string" && spec.includes("=")) {
+        const [name, envVar] = spec.split("=");
+        const value = process.env[envVar || name];
+        if (!value) { console.error(`env $${envVar || name} is empty`); process.exit(2); }
+        flags[target] = value;
+      }
+    }
+  }
+  try {
+    const res = await send(verb, positional.slice(1), flags);
+    if (res.error) { console.error(res.error); process.exit(2); }
+    console.log(JSON.stringify(res, null, 1));
+    process.exit(res.authenticated === false ? 2 : 0);
   } catch (e) { console.error(String(e.message)); process.exit(1); }
 } else {
   try {
