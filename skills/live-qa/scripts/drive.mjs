@@ -118,12 +118,20 @@ async function daemon() {
   try { rmSync(SOCK); } catch {}
   mkdirSync(DIR, { recursive: true });
 
+  // Google, Microsoft and a few banks refuse OAuth in a browser that advertises
+  // navigator.webdriver. Playwright sets it via --enable-automation, so drop that flag
+  // (pass --automation only to reproduce a site's bot block).
+  const humanish = {
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: ["--disable-blink-features=AutomationControlled",
+           "--no-default-browser-check", "--no-first-run"],
+  };
   const launch = async (opts) => {
-    try { return await chromium.launchPersistentContext(`${DIR}/profile`, { ...opts, channel: "chrome" }); }
+    try { return await chromium.launchPersistentContext(`${DIR}/profile`, { ...humanish, ...opts, channel: "chrome" }); }
     catch (e) {
       const m = String(e.message);
       if (m.includes("Chromium distribution") || m.includes("Executable doesn't exist")) {
-        return chromium.launchPersistentContext(`${DIR}/profile`, opts);
+        return chromium.launchPersistentContext(`${DIR}/profile`, { ...humanish, ...opts });
       }
       throw e;
     }
@@ -132,9 +140,19 @@ async function daemon() {
   const handlers = {
     async start({ positional, flags }) {
       const opts = { headless: !flags.headed, viewport: { width: 1280, height: 800 } };
+      if (flags.automation) { opts.ignoreDefaultArgs = []; opts.args = []; }
       if (flags.viewport) {
         const [w, h] = String(flags.viewport).split("x").map(Number);
         opts.viewport = { width: w, height: h };
+      }
+      if (flags.attach) {
+        // Attach to a Chrome the human started. No automation flags, no fresh profile:
+        // this is the only reliable way past Google/Microsoft SSO bot checks.
+        ctx = await chromium.connectOverCDP(`http://127.0.0.1:${flags.attach}`);
+        page = ctx.contexts()[0].pages()[0] || (await ctx.pages()[0] || ctx.contexts()[0].newPage());
+        await ctx.contexts()[0].addInitScript(INIT);
+        if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
+        return { url: page.url(), title: await page.title(), attached: flags.attach };
       }
       if (flags.storage) {
         const state = JSON.parse(readFileSync(flags.storage, "utf8"));

@@ -74,6 +74,17 @@ node <skill>/scripts/drive.mjs auth probe \
   --check https://stage.example.com/dashboard --api https://stage.example.com/api/me
 ```
 
+**Google/Microsoft SSO refuses automated browsers** ("Couldn't sign you in"). The driver
+already drops Playwright's `--enable-automation` flag (`navigator.webdriver === false`,
+verified), and if a provider still refuses, attach to the Chrome the human already uses:
+
+```bash
+google-chrome --remote-debugging-port=9444 --user-data-dir="$HOME/.config/google-chrome"
+node <skill>/scripts/drive.mjs start https://stage.example.com/login --attach 9444
+# one click on "Sign in with Google" — that profile is already signed in
+node <skill>/scripts/drive.mjs auth state .tmp/live-qa/auth/stage.json
+```
+
 Rules the tool enforces: credentials only from `$LIVE_QA_USER` / `$LIVE_QA_PASS` (never
 argv, never disk, never screenshotted); state files are `0600` in a `0700` `.tmp/` dir
 and contain no password; `auth probe` refuses to let you confuse "page rendered" with

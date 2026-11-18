@@ -176,7 +176,33 @@ The default is the state file, which contains no password at all (verified).
 `auth open` also captures nothing until the *form is submitted* in that window, so
 opening a login page and walking away yields no secrets.
 
-### d) SSO — the same, with the identity provider
+### d) SSO when the provider blocks automated browsers
+
+Google (and Microsoft, and most banks) refuse `OAuth` sign-in from a browser that
+advertises automation — the page reads *"Couldn't sign you in. This browser or app may
+not be secure."* Two things matter:
+
+1. `drive.mjs` already launches Chrome **without** `--enable-automation` and with
+   `AutomationControlled` disabled, so `navigator.webdriver` is `false` (verified).
+   `--automation` puts the flag back, which is how you reproduce a site's bot block.
+2. If the provider still refuses (it can decide *after* the password), do not fight it —
+   use the browser the human actually uses:
+
+```bash
+# the human starts Chrome once, with a debug port, on their own profile
+google-chrome --remote-debugging-port=9444 --user-data-dir="$HOME/.config/google-chrome"
+# the agent attaches: no automation flags, real cookies, Google is happy
+node drive.mjs start https://stage.example.com/login --attach 9444
+node drive.mjs click "button:Sign in with Google"        # already signed in → one click
+node drive.mjs auth state .tmp/live-qa/auth/stage.json   # harvest the app session
+node drive.mjs close
+```
+
+Because that profile is already signed into Google, the SSO round-trip is one click and
+no identity-provider password is ever typed into an automated browser. Prefer this over
+`auth login` for any SSO app.
+
+### e) SSO — a human signs in, you keep the session
 
 Google/Microsoft/Okta cannot be automated: MFA is the point. Run headed, ask the
 user to finish the sign-in in that window, then capture the state:
@@ -187,7 +213,7 @@ node drive.mjs start https://stage.example.com --headed
 node drive.mjs auth state .tmp/live-qa/auth/stage-sso.json
 ```
 
-### e) A copied Chrome profile — last resort
+### f) A copied Chrome profile — last resort
 
 `start <url> --profile /path/to/profile` reuses a real profile. It only works if
 Chrome is not holding it, cookies decrypt for the same OS user, and the session has
