@@ -128,6 +128,7 @@ node drive.mjs auth login --save .tmp/live-qa/auth/stage.json \
      --user-selector "#username" --pass-selector "#password"
 # later, and in CI, with no credentials in the environment at all:
 node drive.mjs start https://stage.example.com --storage .tmp/live-qa/auth/stage.json
+node drive.mjs auth probe --check https://stage.example.com/dashboard   # must exit 0
 node drive.mjs auth probe --check https://stage.example.com/dashboard \
      --api https://stage.example.com/api/me
 ```
@@ -166,9 +167,16 @@ node drive.mjs auth wait --save .tmp/live-qa/auth/stage.json \
      --api   https://stage.example.com/api/me --timeout 120
 ```
 
-`auth open` forces a headed window and returns immediately, so the terminal is free.
-`auth wait` polls, saves the state the moment the session exists, and prints the account
-it saw. Add `--capture-creds <file>` and it also writes what was submitted
+`auth open` opens **one** window and returns immediately, so the terminal is free. Call
+it again and it reuses that window (`windowReused: true`) instead of relaunching — which
+matters, because relaunching is what throws away a half-typed password and makes the
+tool look like "it keeps opening new windows".
+
+`auth wait` polls for up to `--timeout` seconds (default **900**), saves the state the
+moment the session exists, prints the account it saw, and then **closes the window** —
+the browser has done its job. Pass `--keep-open` if you want to keep looking at it. If
+nothing happened in the window it exits 2 and leaves the window alone, so the human can
+carry on typing. Add `--capture-creds <file>` and it also writes what was submitted
 (`{account, values}`) to a `0600` file — the only way to get a password out of this
 tool, and it says so: that file is a password, move it to a secret store and delete it.
 The default is the state file, which contains no password at all (verified).
@@ -232,6 +240,9 @@ not expired — **verified to fail silently otherwise**, so always follow it wit
 - `.tmp/live-qa/auth/` belongs in `.gitignore`; a state file is a live session, so it
   is `0600`, expires on its own, and `auth state` should be re-captured when stale
   rather than carried between environments.
+- `--storage` is applied by hand on launch (a persistent context ignores Playwright's
+  `storageState` option): cookies are added and localStorage is written per origin at
+  document start. Verify with `auth probe` before trusting a restored session.
 - **Prove it**: `auth probe` exits 0 only when authenticated (no password field, not
   redirected to `/login`, and 200 from `--api` when given). Exit 2 means guest —
   report that instead of testing a logged-out app and calling the results QA.

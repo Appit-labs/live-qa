@@ -114,7 +114,7 @@ function parseArgs(argv) {
 /* ------------------------------------------------------------------ daemon */
 
 async function daemon() {
-  let ctx, page;
+  let ctx, page, headed = false;
   try { rmSync(SOCK); } catch {}
   mkdirSync(DIR, { recursive: true });
 
@@ -154,11 +154,12 @@ async function daemon() {
         if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
         return { url: page.url(), title: await page.title(), attached: flags.attach };
       }
+      let restore = null;
       if (flags.storage) {
-        const state = JSON.parse(readFileSync(flags.storage, "utf8"));
-        opts.storageState = state;
+        restore = JSON.parse(readFileSync(flags.storage, "utf8"));
       }
       ctx = await launch(opts);
+      if (restore) await applyState(ctx, restore);   // launchPersistentContext ignores storageState
       await ctx.addInitScript(INIT);
       page = ctx.pages()[0] || (await ctx.newPage());
       await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -265,36 +266,59 @@ async function daemon() {
       // Hand the login to a human: open a visible window, install the capture hook,
       // return immediately. `auth wait` picks it up when the sign-in completes.
       const { positional, flags } = req;
-      if (!flags.headed) {
+      let reused = false;
+      if (ctx && headed) {
+        // A window is already open for the human: keep it. Navigating away would throw
+        // away a half-typed password and look like "it keeps opening new windows".
+        reused = true;
+        if (positional[0] && !page.url().startsWith(positional[0])) {
+          await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
+        }
+      } else {
         if (ctx) await ctx.close().catch(() => {});
         ctx = await launch({ headless: false, viewport: { width: 1280, height: 860 } });
+        headed = true;
         await ctx.addInitScript(INIT);
         page = ctx.pages()[0] || (await ctx.newPage());
+        if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
       }
-      if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
-      return { url: page.url(), headed: true,
-               message: "sign in in the window that just opened, then run: drive.mjs auth wait --save <file>" };
+      return { url: page.url(), headed: true, windowReused: reused,
+               message: "sign in in the window that is open, then run: drive.mjs auth wait --save <file> " +
+                        "(it closes the window when the session exists)" };
     },
 
     async "auth-wait"(req) {
       const { flags } = req;
-      const timeout = Number(flags.timeout || 300) * 1000;
+      const timeout = Number(flags.timeout || 900) * 1000;
       const started = Date.now();
       let last = null;
+      let captured = [];
       // Poll on the page the human is looking at: navigating to --check would wipe the
       // in-page record of what they submitted. Verify with --check afterwards.
-      const pollReq = { ...req, flags: { ...flags, check: undefined, api: undefined } };
+      const pollReq = { ...req, flags: { ...flags, check: undefined } };
       while (Date.now() - started < timeout) {
+        // Read whatever was submitted *before* anything can navigate away from it.
+        try {
+          const seen = await page.evaluate(() => (window.__qa && window.__qa.submits) || []);
+          if (seen.length) captured = seen;
+        } catch {}
         last = await probeState(pollReq);
         if (last.authenticated) break;
         await new Promise(r => setTimeout(r, 1500));
+      }
+      if (!last.authenticated && flags.check) {
+        // Nothing happened in the window, but the session may already be valid (a state
+        // file, a cookie the app set silently). One navigation decides — at the end, so
+        // it never interrupts someone typing.
+        last = await probeState(req);
       }
       if (!last.authenticated) {
         return { ...last, waited: Math.round((Date.now() - started) / 1000),
                  error: "not authenticated yet — finish the sign-in in the window, then re-run auth wait" };
       }
       const out = { ...last, waited: Math.round((Date.now() - started) / 1000) };
-      const submits = await page.evaluate(() => (window.__qa && window.__qa.submits) || []).catch(() => []);
+      const submits = captured.length ? captured
+        : await page.evaluate(() => (window.__qa && window.__qa.submits) || []).catch(() => []);
       if (flags.save) {
         const saved = await handlers.state({ positional: [flags.save] });
         out.stateFile = saved.file;
@@ -321,6 +345,15 @@ async function daemon() {
         out.url = verified.url;
         out.apiStatus = verified.apiStatus;
         if (!verified.authenticated) out.error = "session did not survive the --check probe";
+      }
+      // Once the session is captured the browser has done its job: close it, unless the
+      // caller asked to keep the window (--keep-open).
+      if (!flags["keep-open"] && out.verified !== false) {
+        await ctx?.close().catch(() => {});
+        ctx = null;
+        page = null;
+        headed = false;
+        out.windowClosed = true;
       }
       return out;
     },
@@ -354,8 +387,28 @@ async function daemon() {
       return { injected, ...after };
     },
 
-    async close() { await ctx?.close(); return { closed: true }; },
+    async close() { await ctx?.close(); ctx = null; page = null; headed = false; return { closed: true }; },
   };
+
+  // A persistent context ignores the storageState option, so a saved session has to be
+  // applied by hand: cookies first, then localStorage per origin at document start.
+  async function applyState(context, state) {
+    if (state.cookies?.length) await context.addCookies(state.cookies);
+    const origins = state.origins || [];
+    if (origins.length) {
+      await context.addInitScript((entries) => {
+        try {
+          for (const { origin, localStorage: items } of entries) {
+            if (location.origin !== origin) continue;
+            for (const { name, value } of items || []) {
+              try { window.localStorage.setItem(name, value); } catch {}
+            }
+          }
+        } catch {}
+      }, origins);
+    }
+    return { cookies: (state.cookies || []).length, origins: origins.length };
+  }
 
   async function probeState(req) {
     const { flags } = req;
@@ -402,7 +455,8 @@ async function daemon() {
       try {
         const fn = handlers[req.cmd];
         if (!fn) throw new Error(`unknown command ${req.cmd}`);
-        if (!page && req.cmd !== "start") throw new Error("no page: run `start <url>` first");
+        const needsPage = !["start", "auth-open", "auth-wait", "close"].includes(req.cmd);
+        if (!page && needsPage) throw new Error("no page: run `start <url>` first");
         const result = await fn(req);
         socket.end(JSON.stringify({ ok: true, result }) + "\n");
         if (req.cmd === "close") { server.close(); process.exit(0); }
@@ -435,6 +489,22 @@ function send(cmd, positional, flags, { quiet = false } = {}) {
   });
 }
 
+function spawnDaemon(startArgs) {
+  try { rmSync(SOCK); } catch {}
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "start", ...startArgs, "--daemon"], {
+    detached: true, stdio: "ignore", env: process.env,
+  });
+  child.unref();
+}
+
+async function ensureDaemon(startArgs = []) {
+  try { await send("url", [], {}); return; } catch (e) {
+    if (!String(e.message).includes("no browser")) return;   // daemon is up, page may be closed
+  }
+  spawnDaemon(startArgs);
+  if (!(await waitForSocket())) fail("browser did not come up (check: npx playwright install chromium)");
+}
+
 async function waitForSocket(ms = 20000) {
   const start = Date.now();
   while (Date.now() - start < ms) {
@@ -459,11 +529,7 @@ if (isDaemon) {
 } else if (cmd === "start") {
   if (!positional[0]) { console.error("start needs a URL"); process.exit(2); }
   try { await send("close", [], {}); } catch {}
-  try { rmSync(SOCK); } catch {}
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "start", ...rest, "--daemon"], {
-    detached: true, stdio: "ignore", env: process.env,
-  });
-  child.unref();
+  spawnDaemon(rest);
   if (!(await waitForSocket())) { console.error("browser did not come up (check: npx playwright install chromium)"); process.exit(1); }
   try {
     const res = await send("start", positional, flags);
@@ -499,6 +565,7 @@ if (isDaemon) {
     }
   }
   try {
+    if (verb === "auth-open") await ensureDaemon([]);
     const res = await send(verb, positional.slice(1), flags);
     if (res.error) { console.error(res.error); process.exit(2); }
     console.log(JSON.stringify(res, null, 1));
