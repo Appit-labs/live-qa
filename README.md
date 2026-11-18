@@ -132,6 +132,12 @@ The demo above is not a mockup: `demos/live-qa.json` holds the captured run and
 The Turnstile finding behind this skill, in article form:
 [your-cloudflare-turnstile-may-never-be-issuing-a-token-here-…](https://dev.to/ibrahimbdr/your-cloudflare-turnstile-may-never-be-issuing-a-token-here-is-the-one-liner-that-tells-you-4h75)
 
+## Provenance
+
+Every command in this skill was run against a real target before it was written down: a live
+database, a staging host, a failing CI run, a browser session. The repository was created and
+published on 2026-11-18; where the workflow itself is older, `CHANGELOG.md` carries the dates.
+
 ## Security
 
 SkillSpector: **0/100, SAFE, 0 open findings** against the committed baseline. Every accepted
