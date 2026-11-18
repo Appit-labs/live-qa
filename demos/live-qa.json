@@ -1,0 +1,56 @@
+{
+  "skill": "live-qa",
+  "out": "live-qa/demo.gif",
+  "caption": "live-qa \u2014 a real browser, driven from a shell",
+  "steps": [
+    {
+      "cmd": "drive.mjs start https://www.saucedemo.com",
+      "phase": "start",
+      "out": [
+        "{\"url\":\"https://www.saucedemo.com/\",\"title\":\"Swag Labs\"}"
+      ]
+    },
+    {
+      "cmd": "drive.mjs links",
+      "phase": "look",
+      "out": [
+        "input:Username",
+        "input:Password",
+        "input:Login"
+      ]
+    },
+    {
+      "cmd": "drive.mjs fill \"textbox:Username\" standard_user",
+      "phase": "act",
+      "out": [
+        "standard_user"
+      ]
+    },
+    {
+      "cmd": "drive.mjs click \"button:Login\"",
+      "phase": "act",
+      "out": [
+        "{\"url\":\"https://www.saucedemo.com/inventory.html\"}"
+      ]
+    },
+    {
+      "cmd": "drive.mjs eval ...inventory_item...",
+      "phase": "assert",
+      "out": [
+        "6"
+      ]
+    }
+  ],
+  "images": [
+    {
+      "path": "live-qa/step-1-login.png",
+      "caption": "live-qa \u2014 a public demo app, nothing proprietary",
+      "phase": "shot 01"
+    },
+    {
+      "path": "live-qa/step-2-inventory.png",
+      "caption": "live-qa \u2014 logged in, 6 items asserted, screenshot verified",
+      "phase": "shot 03"
+    }
+  ]
+}
