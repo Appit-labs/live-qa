@@ -236,28 +236,38 @@ Chrome is not holding it, cookies decrypt for the same OS user, and the session 
 not expired — **verified to fail silently otherwise**, so always follow it with
 `auth probe`.
 
-### Rules that keep this safe
+### Five ways an agent can sign in with no human at all
 
-- **Test accounts only**, one per role (admin, member) — never a personal login, never
-  `admin@company.com` shared across parallel runs.
-- `--capture-creds` writes a password to disk on purpose: only with the owner's consent,
-  always `0600`, deleted after it is moved into a secret store, and never pasted into a
-  report or a screenshot.
-- **No password on disk, in git, in argv or in a screenshot.** `auth login` reads it
-  from `$LIVE_QA_USER` / `$LIVE_QA_PASS` only.
-- `.tmp/live-qa/auth/` belongs in `.gitignore`; a state file is a live session, so it
-  is `0600`, expires on its own, and `auth state` should be re-captured when stale
-  rather than carried between environments.
-- `--storage` is applied by hand on launch (a persistent context ignores Playwright's
-  `storageState` option): cookies are added and localStorage is written per origin at
-  document start. Verify with `auth probe` before trusting a restored session.
-- **Prove it**: `auth probe` exits 0 only when authenticated — no password field, not
-  redirected to `/login`, and with `--api` the endpoint must *not* answer 401/403 (a 400
-  or 404 for a signed-in user still counts as a session; the status is printed either
-  way). Exit 2 means guest —
-  report that instead of testing a logged-out app and calling the results QA.
-- A `--check` URL is mandatory in practice: probe a page or endpoint that only
-  responds when signed in.
+Ranked by how little a human has to do — the top three need nobody in the loop.
+
+| # | Way | Command | Needs |
+| --- | --- | --- | --- |
+| 1 | **Minted session** | `auth inject --cookie "session=$TOKEN"` / `--local-storage "auth_token=$TOKEN"` | a `/api/test-session` endpoint on a non-production env |
+| 2 | **API login (no UI)** | `auth request --method POST --url https://app/api/login --json '{"username":"${LIVE_QA_USER}","password":"${LIVE_QA_PASS}"}'` | the app's own JSON login route; the request runs inside the browser context, so `Set-Cookie` lands in it |
+| 3 | **Form login + TOTP** | `auth login --totp-env LIVE_QA_TOTP_SECRET` | a test account with an authenticator secret you own |
+| 4 | Google service account | exchange an SA JWT for the app's token in your own script, then `auth inject` | app accepts Google identities |
+| 5 | Microsoft client credentials | `POST /{tenant}/oauth2/v2.0/token` with `client_credentials`, then `auth inject` | an app registration; the app must accept the token |
+
+`auth totp` on its own prints the current code (`--at <epoch>` for a fixed moment, `--digits 8`),
+and is checked against the RFC 6238 vectors.
+
+### Keeping the session safe (this is the part people get wrong)
+
+A state file **is** a credential: it can drive a logged-in session. Five rules, enforced here:
+
+1. **Encrypt at rest.** Set `LIVE_QA_STATE_KEY` and `auth state` writes `AES-256-GCM` (scrypt-derived
+   key, per-file salt, `QAENC1` header) instead of JSON. `--storage` decrypts on load; a wrong or
+   missing key fails loudly instead of silently starting a guest session. In CI the key comes from
+   Vault / AWS Secrets Manager / Doppler — never from the repo.
+2. **Metadata, not secrets**: `auth info <file>` prints cookie count, hosts, `savedAt` and the
+   earliest `expiresAt` without revealing a single value.
+3. **Short life.** The file records its expiry; re-harvest instead of carrying one file between
+   environments. A session that is a week old is a liability, not a convenience.
+4. **One file per environment and per role**, `0600` inside a `0700` directory that is gitignored
+   (`.tmp/live-qa/auth/`). Never commit it, never paste it into a ticket.
+5. **No long-lived passwords.** Credentials come from the environment for the duration of one
+   request (`auth login`, `auth request`); nothing is written to disk. `--capture-creds` exists for
+   the case where the owner explicitly wants the password, and says so in its output.
 
 ## 7. Stop and ask before these
 

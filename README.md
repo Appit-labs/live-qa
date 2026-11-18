@@ -90,6 +90,16 @@ Verified on a real app, end to end: copied Chrome profile → `--attach` → one
 cookies set → `auth probe --api …` → authenticated → `auth state` (92 cookies, `0600`)
 → **fresh browser with `--storage` renders the signed-in dashboard**.
 
+**No human needed at all** — three agent-only routes: `auth inject` (a minted session token),
+`auth request` (POST the app's own JSON login inside the browser context, so `Set-Cookie` lands
+there) and `auth login --totp-env` (form login + a TOTP code generated from your test secret,
+verified against the RFC 6238 vectors).
+
+**Session files are encrypted by default when a key is present**: set `LIVE_QA_STATE_KEY` and
+`auth state` writes AES-256-GCM (`QAENC1`, scrypt-derived key, per-file salt); `--storage` decrypts
+on load, and a wrong key fails loudly rather than silently starting a guest session. `auth info`
+prints metadata only — cookie count, hosts, `savedAt`, `expiresAt` — never a value.
+
 Rules the tool enforces: credentials only from `$LIVE_QA_USER` / `$LIVE_QA_PASS` (never
 argv, never disk, never screenshotted); state files are `0600` in a `0700` `.tmp/` dir
 and contain no password; `auth probe` refuses to let you confuse "page rendered" with

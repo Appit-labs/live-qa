@@ -22,8 +22,9 @@
  * `start` launches a detached daemon that owns the browser, so state survives between
  * commands. The daemon speaks JSON over a UNIX socket in /tmp/qa-driver/daemon.sock.
  */
-import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, chmodSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, chmodSync, renameSync } from "node:fs";
 import { createRequire } from "node:module";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHmac } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createServer, connect } from "node:net";
@@ -95,6 +96,63 @@ window.__qa = window.__qa || { console: [], errors: [], failed: [] };
 })();
 `;
 const isDaemon = process.argv.includes("--daemon");
+const MAGIC = "QAENC1";
+
+function stateKey(flags = {}) {
+  // The passphrase belongs to the shell that runs the command, so the client hands it
+  // over (in memory) when the daemon does not have it.
+  const fromEnv = flags["key-value"] || process.env[flags["key-env"] || "LIVE_QA_STATE_KEY"];
+  if (fromEnv) return Buffer.from(fromEnv, "utf8").length >= 16 ? Buffer.from(fromEnv, "utf8") : scryptSync(fromEnv, "live-qa", 32);
+  return null;
+}
+
+function encryptState(payload, key) {
+  const salt = randomBytes(16), iv = randomBytes(12);
+  const k = scryptSync(key, salt, 32);
+  const c = createCipheriv("aes-256-gcm", k, iv);
+  const body = Buffer.concat([c.update(JSON.stringify(payload), "utf8"), c.final()]);
+  return [MAGIC, salt.toString("base64"), iv.toString("base64"), c.getAuthTag().toString("base64"),
+          body.toString("base64")].join("\n");
+}
+
+function decryptState(text, key) {
+  const [magic, salt, iv, tag, body] = text.split("\n");
+  if (magic !== MAGIC) return JSON.parse(text);
+  const k = scryptSync(key, Buffer.from(salt, "base64"), 32);
+  const d = createDecipheriv("aes-256-gcm", k, Buffer.from(iv, "base64"));
+  d.setAuthTag(Buffer.from(tag, "base64"));
+  return JSON.parse(Buffer.concat([d.update(Buffer.from(body, "base64")), d.final()]).toString("utf8"));
+}
+
+function readStateFile(file, flags = {}) {
+  const raw = readFileSync(file, "utf8");
+  if (!raw.startsWith(MAGIC)) return JSON.parse(raw);
+  const key = stateKey(flags);
+  if (!key) throw new Error(`${file} is encrypted: set $LIVE_QA_STATE_KEY (or --key-env NAME)`);
+  try { return decryptState(raw, key); }
+  catch { throw new Error(`cannot decrypt ${file}: wrong passphrase`); }
+}
+
+function totp(secret, at = Date.now(), digits = 6, step = 30) {
+  const b32 = secret.replace(/[\s-]/g, "").toUpperCase().replace(/=+$/, "");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const ch of b32) {
+    const v = alphabet.indexOf(ch);
+    if (v < 0) throw new Error("secret is not base32");
+    bits += v.toString(2).padStart(5, "0");
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  const counter = Math.floor(at / 1000 / step);
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter / 2 ** 32), 0);
+  buf.writeUInt32BE(counter % 2 ** 32, 4);
+  const h = createHmac("sha1", Buffer.from(bytes)).update(buf).digest();
+  const off = h[h.length - 1] & 0xf;
+  const code = ((h[off] & 0x7f) << 24 | h[off + 1] << 16 | h[off + 2] << 8 | h[off + 3]) % 10 ** digits;
+  return String(code).padStart(digits, "0");
+}
 const fail = (msg, code = 1) => { console.error(msg); process.exit(code); };
 // Inside the daemon a bad request must not kill the browser: throw, let the reply carry it.
 const bad = (msg) => { throw new Error(msg); };
@@ -163,7 +221,7 @@ async function daemon() {
       }
       let restore = null;
       if (flags.storage) {
-        restore = JSON.parse(readFileSync(flags.storage, "utf8"));
+        restore = readStateFile(flags.storage, flags);
       }
       ctx = await launch(opts);
       if (restore) await applyState(ctx, restore);   // launchPersistentContext ignores storageState
@@ -226,16 +284,24 @@ async function daemon() {
     },
 
     /* ---------------------------------------------------------- auth --------- */
-    async state({ positional }) {
+    async state({ positional, flags = {} }) {
       // storageState = cookies + localStorage (+ IndexedDB). It is a live session:
       // write it 0600, under a directory the project ignores, never into git.
       const file = positional[0] || bad("state needs a file path");
       mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-      await ctx.storageState({ path: file, indexedDB: true });
-      try { chmodSync(file, 0o600); } catch {}
-      const state = JSON.parse(readFileSync(file, "utf8"));
-      return { file, cookies: (state.cookies || []).length,
-               origins: (state.origins || []).length, bytes: readFileSync(file).length };
+      const tmp = `${file}.tmp`;
+      await ctx.storageState({ path: tmp, indexedDB: true });
+      let state = JSON.parse(readFileSync(tmp, "utf8"));
+      const expiries = (state.cookies || []).map(c => c.expires).filter(e => e > 0);
+      state.savedAt = new Date().toISOString();
+      state.expiresAt = expiries.length ? new Date(Math.min(...expiries) * 1000).toISOString() : null;
+      const key = stateKey(flags);
+      writeFileSync(tmp, key ? encryptState(state, key) : JSON.stringify(state));
+      try { chmodSync(tmp, 0o600); } catch {}
+      renameSync(tmp, file);
+      return { file, cookies: (state.cookies || []).length, origins: (state.origins || []).length,
+               bytes: readFileSync(file).length, encrypted: Boolean(key),
+               savedAt: state.savedAt, expiresAt: state.expiresAt };
     },
 
     async "auth-login"(req) {
@@ -260,6 +326,22 @@ async function daemon() {
         page.locator(submitSel).first().click({ timeout: 15000 }),
       ]);
       await page.waitForTimeout(800);
+      // A second step (authenticator code) is the usual follow-up. If an OTP secret was
+      // provided, complete it — a dedicated test secret, not a bypass of the MFA.
+      const totpEnv = flags["totp-env"];
+      if (totpEnv && process.env[totpEnv]) {
+        const codeField = page.locator('input[name*=code i], input[id*=code i], input[autocomplete="one-time-code"]').first();
+        if (await codeField.count()) {
+          const code = totp(process.env[totpEnv]);
+          await codeField.fill(code, { timeout: 10000 }).catch(() => {});
+          const submit = page.locator('input[type=submit], button[type=submit]').first();
+          await Promise.all([
+            page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {}),
+            submit.click({ timeout: 10000 }).catch(() => {}),
+          ]);
+          await page.waitForTimeout(800);
+        }
+      }
       const after = await probeState(req);
       if (!after.authenticated) return { ...after, error: "still not authenticated after submit" };
       if (flags.save) {
@@ -363,6 +445,41 @@ async function daemon() {
         headed = false;
       }
       return out;
+    },
+
+    async "auth-info"(req) {
+      const file = req.positional[0] || bad("auth info needs a file");
+      const raw = readFileSync(file, "utf8");
+      const state = readStateFile(file, req.flags);
+      const cookies = state.cookies || [];
+      const expiries = cookies.map(c => c.expires).filter(e => e > 0);
+      return { file, encrypted: raw.startsWith(MAGIC), cookies: cookies.length,
+               origins: (state.origins || []).length,
+               savedAt: state.savedAt || null,
+               expiresAt: state.expiresAt || (expiries.length ? new Date(Math.min(...expiries) * 1000).toISOString() : null),
+               hosts: [...new Set(cookies.map(c => c.domain))].slice(0, 8),
+               appCookies: cookies.map(c => c.name).filter(n => !/^(SID|HSID|SSID|APISID|SAPISID|NID|OSID|LSID|AEC|ACCOUNT_CHOOSER|__Secure-|_ga|IDE|MUID|SRM_B|tuuid|demdex|AMCV|mbox|tvid|CMID|MSFPC|clocale|brcap|wlidperf|OIDC|OTZ|WMF|rlas3|_clck|_utm|VISITOR|LOGIN_INFO|kndctr|__Host-GAPS|Microsoft|MC1|_GRECAPTCHA)/.test(n)) };
+    },
+
+    async "auth-request"(req) {
+      // API login without any UI: the request runs in the browser context, so the
+      // Set-Cookie response lands in the context and the next navigation is signed in.
+      const { flags } = req;
+      const url = flags.url || bad("auth request needs --url");
+      const method = (flags.method || "GET").toUpperCase();
+      let data;
+      if (flags.json || flags["json-env"]) {
+        const src = flags["json-env"] ? process.env[flags["json-env"]] : flags.json;
+        if (!src) bad(`env $${flags["json-env"]} is empty`);
+        // ${USER}/${PASS} are filled from the caller's environment, never from argv.
+        data = String(src).replace(/\$\{?(\w+)\}?/g, (_, name) => process.env[name] ?? "");
+      }
+      const headers = {};
+      if (data) headers["content-type"] = flags["content-type"] || "application/json";
+      const resp = await ctx.request.fetch(url, { method, headers, data, maxRedirects: 0, failOnStatusCode: false });
+      const setCookies = (resp.headersArray() || []).filter(h => h.name.toLowerCase() === "set-cookie").length;
+      return { status: resp.status(), url, method, requestHadBody: Boolean(data),
+               setCookieHeaders: setCookies, cookiesNow: (await ctx.cookies()).length };
     },
 
     async "auth-probe"(req) { return probeState(req); },
@@ -542,6 +659,14 @@ if (isDaemon) {
   console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("*/")[0].replace("/**", ""));
 } else if (cmd === "start") {
   if (!positional[0]) { console.error("start needs a URL"); process.exit(2); }
+  if (typeof flags.storage === "string") {
+    try {
+      if (readFileSync(flags.storage, "utf8").startsWith(MAGIC)) {
+        const name = flags["key-env"] || "LIVE_QA_STATE_KEY";
+        if (process.env[name]) flags["key-value"] = process.env[name];
+      }
+    } catch {}
+  }
   try { await send("close", [], {}); } catch {}
   spawnDaemon(rest);
   if (!(await waitForSocket())) { console.error("browser did not come up (check: npx playwright install chromium)"); process.exit(1); }
@@ -551,9 +676,21 @@ if (isDaemon) {
   } catch (e) { console.error(String(e.message)); process.exit(1); }
 } else if (cmd === "auth") {
   const sub = positional[0];
+  if (sub === "totp") {
+    const secret = process.env[flags["secret-env"] || "LIVE_QA_TOTP_SECRET"];
+    if (!secret) fail("set $LIVE_QA_TOTP_SECRET (or --secret-env NAME) to a base32 authenticator secret");
+    const at = flags.at ? Number(flags.at) : Date.now();
+    const code = totp(secret, at, Number(flags.digits || 6));
+    console.log(JSON.stringify({ code, seconds_left: 30 - Math.floor((at / 1000) % 30), digits: Number(flags.digits || 6) }));
+    process.exit(0);
+  }
   const map = { login: "auth-login", probe: "auth-probe", inject: "auth-inject", state: "state",
-                open: "auth-open", wait: "auth-wait" };
+                open: "auth-open", wait: "auth-wait", info: "auth-info", request: "auth-request" };
   const verb = map[sub] || fail(`auth needs one of: probe | login | state | inject`);
+  if (["state", "auth-info"].includes(verb)) {
+    const name = flags["key-env"] || "LIVE_QA_STATE_KEY";
+    if (process.env[name]) flags["key-value"] = process.env[name];
+  }
   if (verb === "auth-login") {
     // Credentials belong to the shell that runs the command, not to a daemon started
     // minutes earlier: resolve them here and hand them over once, in memory only.
