@@ -210,6 +210,14 @@ Because that profile is already signed into Google, the SSO round-trip is one cl
 no identity-provider password is ever typed into an automated browser. Prefer this over
 `auth login` for any SSO app.
 
+**Verified end to end on a real app:** copied Chrome profile → launched with
+`--remote-debugging-port` → attached → clicked *Sign in with Google* → Google reused the
+existing session (account chooser, no password) → app callback set its session cookies →
+`auth probe --api …` reported authenticated with the account name in the UI →
+`auth state` saved 92 cookies at `0600` → **a fresh browser started with
+`--storage` rendered the same signed-in dashboard**. `auth wait` on an attached browser
+prints `detached: true` and leaves the human's Chrome running.
+
 ### e) SSO — a human signs in, you keep the session
 
 Google/Microsoft/Okta cannot be automated: MFA is the point. Run headed, ask the
@@ -243,8 +251,10 @@ not expired — **verified to fail silently otherwise**, so always follow it wit
 - `--storage` is applied by hand on launch (a persistent context ignores Playwright's
   `storageState` option): cookies are added and localStorage is written per origin at
   document start. Verify with `auth probe` before trusting a restored session.
-- **Prove it**: `auth probe` exits 0 only when authenticated (no password field, not
-  redirected to `/login`, and 200 from `--api` when given). Exit 2 means guest —
+- **Prove it**: `auth probe` exits 0 only when authenticated — no password field, not
+  redirected to `/login`, and with `--api` the endpoint must *not* answer 401/403 (a 400
+  or 404 for a signed-in user still counts as a session; the status is printed either
+  way). Exit 2 means guest —
   report that instead of testing a logged-out app and calling the results QA.
 - A `--check` URL is mandatory in practice: probe a page or endpoint that only
   responds when signed in.

@@ -114,7 +114,7 @@ function parseArgs(argv) {
 /* ------------------------------------------------------------------ daemon */
 
 async function daemon() {
-  let ctx, page, headed = false;
+  let ctx, page, headed = false, attached = null;
   try { rmSync(SOCK); } catch {}
   mkdirSync(DIR, { recursive: true });
 
@@ -126,6 +126,12 @@ async function daemon() {
     args: ["--disable-blink-features=AutomationControlled",
            "--no-default-browser-check", "--no-first-run"],
   };
+  async function shutdownBrowser() {
+    if (attached) { await attached.close().catch(() => {}); attached = null; return "detached"; }
+    await ctx?.close().catch(() => {});
+    return "closed";
+  }
+
   const launch = async (opts) => {
     try { return await chromium.launchPersistentContext(`${DIR}/profile`, { ...humanish, ...opts, channel: "chrome" }); }
     catch (e) {
@@ -148,9 +154,10 @@ async function daemon() {
       if (flags.attach) {
         // Attach to a Chrome the human started. No automation flags, no fresh profile:
         // this is the only reliable way past Google/Microsoft SSO bot checks.
-        ctx = await chromium.connectOverCDP(`http://127.0.0.1:${flags.attach}`);
-        page = ctx.contexts()[0].pages()[0] || (await ctx.pages()[0] || ctx.contexts()[0].newPage());
-        await ctx.contexts()[0].addInitScript(INIT);
+        attached = await chromium.connectOverCDP(`http://127.0.0.1:${flags.attach}`);
+        ctx = attached.contexts()[0] || (await attached.newContext());
+        await ctx.addInitScript(INIT);
+        page = ctx.pages()[0] || (await ctx.newPage());
         if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
         return { url: page.url(), title: await page.title(), attached: flags.attach };
       }
@@ -349,11 +356,11 @@ async function daemon() {
       // Once the session is captured the browser has done its job: close it, unless the
       // caller asked to keep the window (--keep-open).
       if (!flags["keep-open"] && out.verified !== false) {
-        await ctx?.close().catch(() => {});
+        out.windowClosed = (await shutdownBrowser()) === "closed";
+        out.detached = !out.windowClosed;
         ctx = null;
         page = null;
         headed = false;
-        out.windowClosed = true;
       }
       return out;
     },
@@ -387,7 +394,11 @@ async function daemon() {
       return { injected, ...after };
     },
 
-    async close() { await ctx?.close(); ctx = null; page = null; headed = false; return { closed: true }; },
+    async close() {
+      const how = await shutdownBrowser();
+      ctx = null; page = null; headed = false;
+      return { closed: true, mode: how };
+    },
   };
 
   // A persistent context ignores the storageState option, so a saved session has to be
@@ -431,8 +442,11 @@ async function daemon() {
     }
     const cookies = (await ctx.cookies()).map(c => `${c.name}${c.expires > 0 ? "" : " (session)"}`);
     const redirectedToLogin = /\/(login|signin|sign-in|auth)(\?|$)/i.test(page.url());
+    // An authenticated endpoint can answer 400/404 for a signed-in user (missing params,
+    // wrong shape) — only 401/403 mean "no session". Print the status either way.
+    const apiAuthed = typeof apiStatus === "number" && apiStatus !== 401 && apiStatus !== 403;
     const authenticated = flags.api
-      ? apiStatus === 200
+      ? (apiAuthed && loginForm === false)
       : (loginForm === false && !redirectedToLogin);
     return { url: page.url(), loginForm, redirectedToLogin, apiStatus, cookies,
              authenticated: Boolean(authenticated), htmlTitle: await page.title() };
