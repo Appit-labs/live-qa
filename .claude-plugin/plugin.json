@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "description": "Step-by-step live QA in a real browser: numbered screenshot per step, pass/fail table, console/network/a11y evidence.",
   "author": {
-    "name": "Ibrahim M. Badr",
-    "url": "https://github.com/ibrahimbdr"
+    "name": "Appit Labs",
+    "url": "https://github.com/Appit-labs"
   },
-  "homepage": "https://github.com/ibrahimbdr/live-qa",
+  "homepage": "https://github.com/Appit-labs/live-qa",
   "license": "MIT",
   "skills": "./skills"
 }
