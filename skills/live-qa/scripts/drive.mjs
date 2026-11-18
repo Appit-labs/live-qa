@@ -22,7 +22,7 @@
  * `start` launches a detached daemon that owns the browser, so state survives between
  * commands. The daemon speaks JSON over a UNIX socket in /tmp/qa-driver/daemon.sock.
  */
-import { mkdirSync, readFileSync, existsSync, rmSync, readdirSync, chmodSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, chmodSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -69,9 +69,27 @@ window.__qa = window.__qa || { console: [], errors: [], failed: [] };
   console.warn  = (...a) => { c.console.push({ level: "warn",  text: a.map(String).join(" ").slice(0, 400) }); cw(...a); };
   addEventListener("error", e => c.errors.push(String(e.message || e).slice(0, 300)));
   addEventListener("unhandledrejection", e => c.errors.push("unhandledrejection: " + String(e.reason).slice(0, 300)));
+  // Record login submissions (form or JSON) so a session that a human established can
+  // also yield the account it used. Memory only; nothing is sent anywhere.
+  c.submits = [];
+  const grab = (pairs) => {
+    const rec = {};
+    for (const [k, v] of pairs) {
+      if (typeof v === "string" && v && !/^(true|false|on)$/i.test(v)) rec[k] = v;
+    }
+    if (Object.keys(rec).some(k => /pass|secret/i.test(k))) c.submits.push({ at: Date.now(), url: location.href, values: rec });
+  };
+  addEventListener("submit", (e) => {
+    try { grab(new FormData(e.target).entries()); } catch {}
+  }, true);
   const of = window.fetch;
   window.fetch = async (...a) => {
-    try { const r = await of(...a); if (r.status >= 400) c.failed.push({ status: r.status, url: String(a[0]).slice(0, 200) }); return r; }
+    try {
+      const body = a[1] && a[1].body;
+      if (typeof body === "string" && /pass/i.test(body)) {
+        try { grab(Object.entries(JSON.parse(body)).map(([k, v]) => [k, String(v)])); } catch {}
+      }
+      const r = await of(...a); if (r.status >= 400) c.failed.push({ status: r.status, url: String(a[0]).slice(0, 200) }); return r; }
     catch (e) { c.failed.push({ status: "net-error", url: String(a[0]).slice(0, 200) }); throw e; }
   };
 })();
@@ -225,6 +243,70 @@ async function daemon() {
       return after;
     },
 
+    async "auth-open"(req) {
+      // Hand the login to a human: open a visible window, install the capture hook,
+      // return immediately. `auth wait` picks it up when the sign-in completes.
+      const { positional, flags } = req;
+      if (!flags.headed) {
+        if (ctx) await ctx.close().catch(() => {});
+        ctx = await launch({ headless: false, viewport: { width: 1280, height: 860 } });
+        await ctx.addInitScript(INIT);
+        page = ctx.pages()[0] || (await ctx.newPage());
+      }
+      if (positional[0]) await page.goto(positional[0], { waitUntil: "domcontentloaded", timeout: 60000 });
+      return { url: page.url(), headed: true,
+               message: "sign in in the window that just opened, then run: drive.mjs auth wait --save <file>" };
+    },
+
+    async "auth-wait"(req) {
+      const { flags } = req;
+      const timeout = Number(flags.timeout || 300) * 1000;
+      const started = Date.now();
+      let last = null;
+      // Poll on the page the human is looking at: navigating to --check would wipe the
+      // in-page record of what they submitted. Verify with --check afterwards.
+      const pollReq = { ...req, flags: { ...flags, check: undefined, api: undefined } };
+      while (Date.now() - started < timeout) {
+        last = await probeState(pollReq);
+        if (last.authenticated) break;
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      if (!last.authenticated) {
+        return { ...last, waited: Math.round((Date.now() - started) / 1000),
+                 error: "not authenticated yet — finish the sign-in in the window, then re-run auth wait" };
+      }
+      const out = { ...last, waited: Math.round((Date.now() - started) / 1000) };
+      const submits = await page.evaluate(() => (window.__qa && window.__qa.submits) || []).catch(() => []);
+      if (flags.save) {
+        const saved = await handlers.state({ positional: [flags.save] });
+        out.stateFile = saved.file;
+        out.cookies = saved.cookies;
+      }
+      const creds = submits.length ? submits[submits.length - 1].values : null;
+      if (creds) {
+        const userKey = Object.keys(creds).find(k => /user|email|login|account/i.test(k));
+        out.account = userKey ? creds[userKey] : null;
+        out.passwordField = Object.keys(creds).find(k => /pass|secret/i.test(k)) || null;
+        if (flags["capture-creds"]) {
+          const file = String(flags["capture-creds"]);
+          mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+          writeFileSync(file, JSON.stringify({ url: out.url, account: out.account, values: creds }, null, 2) + "\n");
+          try { chmodSync(file, 0o600); } catch {}
+          out.credsFile = file;
+          out.warning = "this file holds a password: move it into a secret store and delete it, " +
+                        "or keep using the state file instead";
+        }
+      }
+      if (flags.check || flags.api) {
+        const verified = await probeState(req);
+        out.verified = verified.authenticated;
+        out.url = verified.url;
+        out.apiStatus = verified.apiStatus;
+        if (!verified.authenticated) out.error = "session did not survive the --check probe";
+      }
+      return out;
+    },
+
     async "auth-probe"(req) { return probeState(req); },
 
     async "auth-inject"(req) {
@@ -371,7 +453,8 @@ if (isDaemon) {
   } catch (e) { console.error(String(e.message)); process.exit(1); }
 } else if (cmd === "auth") {
   const sub = positional[0];
-  const map = { login: "auth-login", probe: "auth-probe", inject: "auth-inject", state: "state" };
+  const map = { login: "auth-login", probe: "auth-probe", inject: "auth-inject", state: "state",
+                open: "auth-open", wait: "auth-wait" };
   const verb = map[sub] || fail(`auth needs one of: probe | login | state | inject`);
   if (verb === "auth-login") {
     // Credentials belong to the shell that runs the command, not to a daemon started

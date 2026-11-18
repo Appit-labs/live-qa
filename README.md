@@ -62,9 +62,12 @@ node <skill>/scripts/drive.mjs start https://stage.example.com --storage .tmp/li
 SESSION_TOKEN=$(curl -s -X POST "$STAGE/api/test-session" | jq -r .token) \
   node <skill>/scripts/drive.mjs auth inject --cookie "session=$SESSION_TOKEN"
 
-# 3. SSO (Google/Microsoft/Okta): sign in once in a headed window, then capture
-node <skill>/scripts/drive.mjs start https://stage.example.com --headed
-node <skill>/scripts/drive.mjs auth state .tmp/live-qa/auth/stage-sso.json
+# 3. no credentials yet? open the login for a human, then harvest what they did
+node <skill>/scripts/drive.mjs auth open https://stage.example.com/login
+# … the person signs in (SSO, MFA, test account — you never hold the password) …
+node <skill>/scripts/drive.mjs auth wait --save .tmp/live-qa/auth/stage.json \
+     --check https://stage.example.com/dashboard --timeout 120
+# add --capture-creds file.json only if they agreed: that file IS a password (0600)
 
 # 4. always prove it — exits 0 only when actually authenticated
 node <skill>/scripts/drive.mjs auth probe \

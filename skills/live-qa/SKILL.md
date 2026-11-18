@@ -153,7 +153,30 @@ SESSION_TOKEN=… node drive.mjs auth inject --local-storage "auth_token=SESSION
 The value is read in your shell and sent once over the local unix socket; it never
 appears in argv, logs or on disk.
 
-### c) SSO — the human signs in once
+### c) A human signs in, you harvest the session — the interactive path
+
+When you do not have the credentials yet (SSO, MFA, a colleague's test account, or you
+simply do not want to hold the password), **open the login and let them type it**:
+
+```bash
+node drive.mjs auth open https://stage.example.com/login      # visible window
+# … the user signs in …
+node drive.mjs auth wait --save .tmp/live-qa/auth/stage.json \
+     --check https://stage.example.com/dashboard \
+     --api   https://stage.example.com/api/me --timeout 120
+```
+
+`auth open` forces a headed window and returns immediately, so the terminal is free.
+`auth wait` polls, saves the state the moment the session exists, and prints the account
+it saw. Add `--capture-creds <file>` and it also writes what was submitted
+(`{account, values}`) to a `0600` file — the only way to get a password out of this
+tool, and it says so: that file is a password, move it to a secret store and delete it.
+The default is the state file, which contains no password at all (verified).
+
+`auth open` also captures nothing until the *form is submitted* in that window, so
+opening a login page and walking away yields no secrets.
+
+### d) SSO — the same, with the identity provider
 
 Google/Microsoft/Okta cannot be automated: MFA is the point. Run headed, ask the
 user to finish the sign-in in that window, then capture the state:
@@ -164,7 +187,7 @@ node drive.mjs start https://stage.example.com --headed
 node drive.mjs auth state .tmp/live-qa/auth/stage-sso.json
 ```
 
-### d) A copied Chrome profile — last resort
+### e) A copied Chrome profile — last resort
 
 `start <url> --profile /path/to/profile` reuses a real profile. It only works if
 Chrome is not holding it, cookies decrypt for the same OS user, and the session has
@@ -175,6 +198,9 @@ not expired — **verified to fail silently otherwise**, so always follow it wit
 
 - **Test accounts only**, one per role (admin, member) — never a personal login, never
   `admin@company.com` shared across parallel runs.
+- `--capture-creds` writes a password to disk on purpose: only with the owner's consent,
+  always `0600`, deleted after it is moved into a secret store, and never pasted into a
+  report or a screenshot.
 - **No password on disk, in git, in argv or in a screenshot.** `auth login` reads it
   from `$LIVE_QA_USER` / `$LIVE_QA_PASS` only.
 - `.tmp/live-qa/auth/` belongs in `.gitignore`; a state file is a live session, so it
