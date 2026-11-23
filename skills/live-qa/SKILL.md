@@ -20,6 +20,8 @@ re-runnable suite see `references/promoting-to-a-spec.md`.
 Works in any agent that can run a shell command: the driving tool is a Node script
 that owns its own Chromium, so no agent-specific browser tool is required.
 
+**Not for:** a committed, re-runnable test suite — this is a one-off evidence run; promote a green run to a Playwright spec via `references/promoting-to-a-spec.md`. A site that blocks local browsers belongs to `cloud-browser`.
+
 ## Portability
 
 Works in any agent that can run shell commands (pi, Claude Code, Codex, Cursor,
@@ -311,3 +313,15 @@ errors" means you cleared, reproduced and read the console, not that you never l
 Then a short diagnostics section (console errors, failed requests, a11y, CWV) and
 one line of summary: steps passed, the single most important failure, what you could
 not test.
+
+Close with one verdict word, because that is the line a human forwards and the only
+part they read:
+
+- **SHIP** — every step passed, console and network clean.
+- **SHIP WITH FIXES** — failures found, none of them blocking.
+- **DO NOT SHIP** — a blocking failure, or any step whose outcome is unknown.
+- **INCONCLUSIVE** — the run itself could not happen: no credentials, no staging, no
+  baseline to compare against.
+
+An unknown outcome is never a pass, and a clean run on the wrong environment is not
+evidence about the right one. Say which URL you tested.
